@@ -80,11 +80,18 @@ func (r *Rebalancer) Config() *config.RebalanceConfig {
 }
 
 // RebalanceMove describes a single object move from one backend to another.
+//
+// SrcStorageKey is where the copy being moved sits on FromBackend, taken from
+// the row the planner selected. The destination's path is minted when the move
+// runs rather than when it is planned, because other writes can take the key
+// while a plan waits, and a path chosen earlier could name bytes the move never
+// wrote.
 type RebalanceMove struct {
-	ObjectKey   string
-	FromBackend string
-	ToBackend   string
-	SizeBytes   int64
+	ObjectKey     string
+	FromBackend   string
+	ToBackend     string
+	SizeBytes     int64
+	SrcStorageKey string
 }
 
 // progressLabel names the move for a streaming caller: the object and the
@@ -340,10 +347,11 @@ func (r *Rebalancer) packMovesFromSource(
 		}
 
 		moves = append(moves, RebalanceMove{
-			ObjectKey:   objects[oi].ObjectKey,
-			FromBackend: src.Name,
-			ToBackend:   dest.Name,
-			SizeBytes:   objects[oi].SizeBytes,
+			ObjectKey:     objects[oi].ObjectKey,
+			FromBackend:   src.Name,
+			ToBackend:     dest.Name,
+			SizeBytes:     objects[oi].SizeBytes,
+			SrcStorageKey: objects[oi].StorageKey,
 		})
 		state.accept(src.Name, dest.Name, objects[oi].SizeBytes)
 		*destFree -= objects[oi].SizeBytes
@@ -499,10 +507,11 @@ func (r *Rebalancer) spreadMovesFromSource(
 		}
 
 		moves = append(moves, RebalanceMove{
-			ObjectKey:   objects[oi].ObjectKey,
-			FromBackend: src.Name,
-			ToBackend:   dest.Name,
-			SizeBytes:   objects[oi].SizeBytes,
+			ObjectKey:     objects[oi].ObjectKey,
+			FromBackend:   src.Name,
+			ToBackend:     dest.Name,
+			SizeBytes:     objects[oi].SizeBytes,
+			SrcStorageKey: objects[oi].StorageKey,
 		})
 		src.Balance -= objects[oi].SizeBytes
 		dest.Balance += objects[oi].SizeBytes
@@ -582,13 +591,15 @@ func (r *Rebalancer) ExecuteOneMove(ctx context.Context, move RebalanceMove, str
 	}
 
 	movedSize, err := r.placement.MoveObject(ctx, &writepath.MoveRequest{
-		Key:         move.ObjectKey,
-		SizeBytes:   move.SizeBytes,
-		SrcBackend:  srcBackend,
-		SrcName:     move.FromBackend,
-		DestBackend: destBackend,
-		DestName:    move.ToBackend,
-		Reasons:     writepath.RebalanceMoveReasons,
+		Key:            move.ObjectKey,
+		SizeBytes:      move.SizeBytes,
+		SrcBackend:     srcBackend,
+		SrcName:        move.FromBackend,
+		DestBackend:    destBackend,
+		DestName:       move.ToBackend,
+		SrcStorageKey:  core.StoragePath(move.ObjectKey, move.SrcStorageKey),
+		DestStorageKey: writepath.NewStorageKey(move.ObjectKey),
+		Reasons:        writepath.RebalanceMoveReasons,
 	})
 	if err != nil {
 		if errors.Is(err, writepath.ErrMoveStale) {

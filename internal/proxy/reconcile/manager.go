@@ -43,7 +43,7 @@ type Stores interface {
 	GetAllObjectLocations(ctx context.Context, key string) ([]core.ObjectLocation, error)
 	DeleteObjectLocation(ctx context.Context, key, backendName string) (int64, error)
 	ListObjectsByBackendKeyAsc(ctx context.Context, backendName, afterKey string, limit int) ([]core.ObjectLocation, error)
-	SweepStaleCleanupQueueRows(ctx context.Context, key, backendName string) (int64, error)
+	SweepStaleCleanupQueueRows(ctx context.Context, storageKey, backendName string) (int64, error)
 }
 
 // BackendResolver looks up a configured backend by name.
@@ -179,7 +179,7 @@ func (m *Manager) logger() *slog.Logger {
 // unmanaged, so it counts toward the backend's quota without any worker acting
 // on it. Returns counts of imported vs skipped objects.
 func (m *Manager) SyncBackend(ctx context.Context, backendName, bucket string, knownBuckets []string) (imported, skipped int, err error) {
-	s3b, err := m.resolveLister(backendName)
+	s3b, err := m.backends.GetBackend(backendName)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -300,7 +300,7 @@ func (m *Manager) importDiscovered(ctx context.Context, req *core.ImportObjectRe
 // ledger rows whose keys are no longer on the backend. A key outside every
 // configured bucket prefix is imported as unmanaged.
 func (m *Manager) ReconcileBackend(ctx context.Context, backendName string, knownBuckets []string) (*Result, error) {
-	s3b, err := m.resolveLister(backendName)
+	s3b, err := m.backends.GetBackend(backendName)
 	if err != nil {
 		return nil, err
 	}
@@ -339,38 +339,21 @@ func (m *Manager) ReconcileBackend(ctx context.Context, backendName string, know
 // failed sweep leaves queue rows that the next pass will retry rather than a
 // reason to fail the reconcile.
 func (m *Manager) deleter() DeleterFn {
-	return func(ctx context.Context, key, backendName string) error {
+	return func(ctx context.Context, key, storageKey, backendName string) error {
 		// The delete credits the backend's stripes in its own transaction, so
 		// there is nothing to tell the routing snapshot; it reloads on its tick.
 		if _, err := m.stores.DeleteObjectLocation(ctx, key, backendName); err != nil {
 			return err
 		}
-		if _, err := m.stores.SweepStaleCleanupQueueRows(ctx, key, backendName); err != nil {
-			m.logger().WarnContext(ctx, "failed to sweep cleanup_queue rows for stale key",
-				slog.String("key", key), slog.String("backend", backendName), "error", err)
+		// Swept by path: what this pass established is that these particular
+		// bytes are absent, so only the deletions queued against them are moot.
+		// Any queued against the key's other writes name bytes still on the
+		// backend.
+		if _, err := m.stores.SweepStaleCleanupQueueRows(ctx, storageKey, backendName); err != nil {
+			m.logger().WarnContext(ctx, "failed to sweep cleanup_queue rows for stale copy",
+				slog.String("key", key), slog.String("storage_key", storageKey),
+				slog.String("backend", backendName), "error", err)
 		}
 		return nil
 	}
-}
-
-// resolveLister unwraps a backend down to the concrete client that can list,
-// past any decorators (circuit breaker, metrics) wrapping it.
-func (m *Manager) resolveLister(name string) (ObjectLister, error) {
-	be, err := m.backends.GetBackend(name)
-	if err != nil {
-		return nil, err
-	}
-	inner := be
-	for {
-		u, ok := inner.(interface{ Unwrap() backend.ObjectBackend })
-		if !ok {
-			break
-		}
-		inner = u.Unwrap()
-	}
-	lister, ok := inner.(ObjectLister)
-	if !ok {
-		return nil, fmt.Errorf("backend %s does not support listing", name)
-	}
-	return lister, nil
 }

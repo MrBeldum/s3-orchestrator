@@ -88,6 +88,12 @@ type StoredForm struct {
 // zero value means managed and a construction site that omits it cannot
 // accidentally produce a row the workers ignore.
 //
+// StorageKey is the path this copy occupies on its backend, and everything that
+// reads, writes or deletes the bytes uses it. A write stores its bytes under
+// the object key plus its own intent id (see internalkey.StorageKey), so two
+// writes of one key never share a path and a cleanup only deletes what its
+// write stored. A row whose bytes are at the object key holds that key here.
+//
 // The compression columns follow StoredForm: an empty algorithm means the
 // bytes are stored verbatim, and they are zero on rows from queries that do
 // not select them.
@@ -99,6 +105,7 @@ type StoredForm struct {
 type ObjectLocation struct {
 	ObjectKey                string
 	BackendName              string
+	StorageKey               string
 	SizeBytes                int64
 	CreatedAt                time.Time
 	Encrypted                bool
@@ -126,6 +133,7 @@ type ObjectLocation struct {
 // the object.
 type ExistingCopy struct {
 	BackendName string
+	StorageKey  string
 	SizeBytes   int64
 	CreatedAt   time.Time
 	Encrypted   bool
@@ -136,11 +144,17 @@ type ExistingCopy struct {
 // removing from their backend, either a copy displaced by an overwrite or
 // delete, or the target of an intent that write superseded.
 //
+// StorageKey is the path to delete, carried here rather than derived from the
+// object key by the caller. A cleanup removes exactly the bytes its row or
+// intent named, so a cleanup that runs after a newer write has committed its
+// own copy cannot take that copy's bytes with it.
+//
 // Reason is the cleanup-queue label the removal is recorded under if it has to
 // be retried, so an operator reading the queue can tell the two apart. An empty
 // Reason means the caller's own default.
 type DeletedCopy struct {
 	BackendName string
+	StorageKey  string
 	SizeBytes   int64
 	Reason      string
 }
@@ -167,6 +181,7 @@ const (
 type SupersededIntent struct {
 	IntentID    string
 	BackendName string
+	StorageKey  string
 	SizeBytes   int64
 }
 
@@ -187,9 +202,15 @@ const (
 // upload. The reaper resolves intents that survive a failed metadata
 // commit so a DB outage between PUT and RecordObject cannot silently
 // destroy the prior copy of an overwritten key.
+//
+// StorageKey is where this copy's bytes are being written, minted from the key
+// and this intent's own id. Recording it before the upload is what lets every
+// path that resolves the intent afterwards - a commit, a discard, the reaper -
+// address exactly the bytes this write placed and nothing else.
 type PendingObject struct {
 	IntentID                 string
 	ObjectKey                string
+	StorageKey               string
 	BackendName              string
 	SizeBytes                int64
 	Encrypted                bool
@@ -415,7 +436,27 @@ type CompletePart struct {
 // CLEANUP QUEUE
 // -------------------------------------------------------------------------
 
+// CleanupRequest is one deletion handed to the retry queue: which backend holds
+// the bytes, where on it they are, which object they were a copy of, why they
+// are going and how many of them there are.
+//
+// StorageKey and ObjectKey are both carried because they answer different
+// questions. The worker deletes the first; the second tells an operator
+// reading the queue or the DLQ what the orphan was. SizeBytes is what
+// orphan_bytes is credited by when the delete finally lands.
+type CleanupRequest struct {
+	BackendName string
+	ObjectKey   string
+	StorageKey  string
+	Reason      string
+	SizeBytes   int64
+}
+
 // CleanupItem represents a pending cleanup operation in the retry queue.
+//
+// StorageKey is the path the worker deletes. ObjectKey is beside it so the
+// admin listing still says which object the orphan belongs to. The two hold
+// the same value when the bytes were stored at the object's key.
 //
 // ClaimedAt and ClaimedBy are populated by ClaimPendingCleanups (the worker
 // path) and surfaced through GetPendingCleanups (the admin display path);
@@ -428,6 +469,7 @@ type CleanupItem struct {
 	ID          int64
 	BackendName string
 	ObjectKey   string
+	StorageKey  string
 	Reason      string
 	Attempts    int32
 	SizeBytes   int64
@@ -443,6 +485,7 @@ type CleanupQueueRow struct {
 	ID          int64
 	BackendName string
 	ObjectKey   string
+	StorageKey  string
 	Reason      string
 	SizeBytes   int64
 	Attempts    int32
@@ -457,6 +500,7 @@ type CleanupQueueRow struct {
 type CleanupDLQItem struct {
 	BackendName   string
 	ObjectKey     string
+	StorageKey    string
 	Reason        string
 	SizeBytes     int64
 	Attempts      int32
@@ -518,6 +562,7 @@ type EncryptedLocation struct {
 type UnencryptedLocation struct {
 	ObjectKey   string
 	BackendName string
+	StorageKey  string
 	SizeBytes   int64
 	Etag        string
 }
@@ -531,6 +576,7 @@ type UnencryptedLocation struct {
 type DecryptableLocation struct {
 	ObjectKey     string
 	BackendName   string
+	StorageKey    string
 	SizeBytes     int64
 	EncryptionKey []byte
 	KeyID         string
@@ -579,6 +625,7 @@ type CompressionStat struct {
 type RewritableLocation struct {
 	ObjectKey                string
 	BackendName              string
+	StorageKey               string
 	SizeBytes                int64
 	Encrypted                bool
 	EncryptionKey            []byte

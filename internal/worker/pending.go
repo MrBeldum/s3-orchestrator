@@ -192,8 +192,11 @@ const (
 // probeBackend HEADs the destination backend and classifies the result.
 // Records one API call against the backend's usage tracker regardless of
 // outcome so usage accounting remains accurate during reaper sweeps.
+//
+// It asks about the intent's own path, so a 200 means this write's bytes are
+// there, not that another write of the key landed on the same backend.
 func (r *PendingReaper) probeBackend(ctx context.Context, be backend.ObjectBackend, p *core.PendingObject) probeOutcome {
-	_, err := r.deps.HeadWithTimeout(ctx, be, p.ObjectKey)
+	_, err := r.deps.HeadWithTimeout(ctx, be, core.StoragePath(p.ObjectKey, p.StorageKey))
 	r.deps.Acct().APICall(s3op.HeadObject, p.BackendName)
 
 	switch {
@@ -313,7 +316,13 @@ func (r *PendingReaper) removeDisplaced(ctx context.Context, key string, displac
 		if reason == "" {
 			reason = "overwrite_displaced"
 		}
-		r.placement.DeleteOrEnqueue(ctx, dcBackend, dc.BackendName, key, reason, dc.SizeBytes)
+		r.placement.DeleteOrEnqueue(ctx, dcBackend, &core.CleanupRequest{
+			BackendName: dc.BackendName,
+			ObjectKey:   key,
+			StorageKey:  dc.StorageKey,
+			Reason:      reason,
+			SizeBytes:   dc.SizeBytes,
+		})
 	}
 }
 

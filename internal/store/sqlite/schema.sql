@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS backend_quota_stripes (
 CREATE TABLE IF NOT EXISTS object_locations (
     object_key     TEXT NOT NULL,
     backend_name   TEXT NOT NULL REFERENCES backend_quotas(backend_name),
+    -- The path this copy's bytes occupy on the backend. A write stores them
+    -- under object_key || '!' || intent_id, so two writes to one backend never
+    -- share a path and a cleanup deletes only its own write's bytes. A row
+    -- whose bytes are at the object key holds storage_key = object_key.
+    storage_key    TEXT NOT NULL,
     size_bytes     INTEGER NOT NULL,
     encrypted      INTEGER NOT NULL DEFAULT 0,
     encryption_key BLOB,
@@ -92,6 +97,12 @@ CREATE INDEX IF NOT EXISTS idx_object_locations_key_created
 
 CREATE INDEX IF NOT EXISTS idx_object_locations_managed
     ON object_locations(backend_name) WHERE managed;
+
+-- Backs reconcile's sorted-merge join, which walks the ledger in the byte order
+-- a backend listing returns. Being unique, it also enforces one object per path
+-- per backend.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_object_locations_backend_storage_key
+    ON object_locations(backend_name, storage_key);
 
 -- Track in-progress multipart uploads.
 CREATE TABLE IF NOT EXISTS multipart_uploads (
@@ -164,6 +175,10 @@ CREATE TABLE IF NOT EXISTS cleanup_queue (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     backend_name TEXT NOT NULL REFERENCES backend_quotas(backend_name),
     object_key   TEXT NOT NULL,
+    -- The path the deletion is for. A queued cleanup outlives the row it came
+    -- from, so the path travels with it; object_key stays beside it so the
+    -- queue still says which object the orphan belongs to.
+    storage_key  TEXT NOT NULL,
     reason       TEXT NOT NULL,
     size_bytes   INTEGER NOT NULL DEFAULT 0,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -187,6 +202,7 @@ CREATE TABLE IF NOT EXISTS cleanup_dlq (
     original_id       INTEGER NOT NULL,
     backend_name      TEXT NOT NULL REFERENCES backend_quotas(backend_name),
     object_key        TEXT NOT NULL,
+    storage_key       TEXT NOT NULL,
     reason            TEXT NOT NULL,
     size_bytes        INTEGER NOT NULL DEFAULT 0,
     attempts          INT NOT NULL,
@@ -222,6 +238,10 @@ CREATE INDEX IF NOT EXISTS idx_notification_outbox_pending
 CREATE TABLE IF NOT EXISTS pending_objects (
     intent_id      TEXT PRIMARY KEY,
     object_key     TEXT NOT NULL,
+    -- Where this write is putting its bytes. Written before the upload, so it
+    -- is the only record of the path if the commit never happens: the reaper
+    -- and the companion-discard path both delete at what it says.
+    storage_key    TEXT NOT NULL,
     backend_name   TEXT NOT NULL REFERENCES backend_quotas(backend_name),
     size_bytes     INTEGER NOT NULL,
     encrypted      INTEGER NOT NULL DEFAULT 0,
@@ -366,4 +386,4 @@ LEFT JOIN (
 LEFT JOIN backend_drains d ON d.backend_name = q.backend_name;
 
 -- Stamp the schema version after all tables and indexes are created.
-INSERT INTO schema_version (version) VALUES (19);
+INSERT INTO schema_version (version) VALUES (20);

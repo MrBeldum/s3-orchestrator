@@ -100,7 +100,9 @@ func (h *storedHasher) hashStored(ctx context.Context, loc *core.ObjectLocation)
 		return storedDigests{}, err
 	}
 
-	result, cancel, err := h.ops.GetWithTimeout(ctx, be, loc.ObjectKey, "")
+	// The copy's own path. A row carrying none keeps its bytes at the object's
+	// key.
+	result, cancel, err := h.ops.GetWithTimeout(ctx, be, core.StoragePath(loc.ObjectKey, loc.StorageKey), "")
 	if err != nil {
 		h.ops.Acct().APICall(s3op.GetObject, loc.BackendName)
 		return storedDigests{}, fmt.Errorf("get object: %w", err)

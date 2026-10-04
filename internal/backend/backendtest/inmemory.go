@@ -22,14 +22,17 @@ package backendtest
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/backend"
+	"github.com/afreidah/s3-orchestrator/internal/internalkey"
 )
 
 // -------------------------------------------------------------------------
@@ -65,17 +68,22 @@ type Object struct {
 //
 // CopyObject always exists, so InMemory satisfies backend.Copier, but it
 // reports ErrCopyNotSupported until a test sets CopyEnabled - which leaves
-// callers on the materialized-copy path by default.
+// callers on the materialized-copy path by default. CopyLandsBeforeErr makes a
+// failing CopyObject write the destination anyway, modelling a server-side copy
+// whose response was lost.
 type InMemory struct {
 	mu sync.Mutex
 
 	Objects map[string]Object
+
+	CopyLandsBeforeErr bool
 
 	PutErr        error
 	GetErr        error
 	HeadErr       error
 	DeleteErr     error
 	HeadBucketErr error
+	ListErr       error
 	GetReadErr    error // surfaces from the body reader, not from GetObject itself
 	GetPanic      bool  // GetObject panics instead of returning
 	DeleteDelay   time.Duration
@@ -279,6 +287,40 @@ func (m *InMemory) DeleteObject(ctx context.Context, key string) error {
 	return nil
 }
 
+// listPageSize is how many keys one ListObjects page holds, matching the S3
+// default so tests that page see the same page boundaries as a real backend.
+const listPageSize = 1000
+
+// ListObjects calls fn with the keys that start with prefix, in byte order,
+// one page at a time. Returns ListErr when set, and stops without error when
+// fn returns backend.ErrStopListing.
+func (m *InMemory) ListObjects(_ context.Context, prefix string, fn func([]backend.ListedObject) error) error {
+	m.mu.Lock()
+	if m.ListErr != nil {
+		err := m.ListErr
+		m.mu.Unlock()
+		return err
+	}
+	listed := make([]backend.ListedObject, 0, len(m.Objects))
+	for key, obj := range m.Objects {
+		if strings.HasPrefix(key, prefix) {
+			listed = append(listed, backend.ListedObject{Key: key, SizeBytes: int64(len(obj.Data)), LastModified: obj.LastModified})
+		}
+	}
+	m.mu.Unlock()
+
+	slices.SortFunc(listed, func(a, b backend.ListedObject) int { return strings.Compare(a.Key, b.Key) })
+	for start := 0; start < len(listed); start += listPageSize {
+		if err := fn(listed[start:min(start+listPageSize, len(listed))]); err != nil {
+			if errors.Is(err, backend.ErrStopListing) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 // HeadBucket satisfies backend.HealthChecker, returning the injected failure.
 func (m *InMemory) HeadBucket(context.Context) error {
 	m.mu.Lock()
@@ -296,12 +338,19 @@ func (m *InMemory) CopyObject(_ context.Context, srcKey, dstKey, _ string, _ map
 		return "", backend.ErrCopyNotSupported
 	}
 	m.CopyCalls++
-	if m.CopyErr != nil {
-		return "", m.CopyErr
-	}
 	src, ok := m.Objects[srcKey]
 	if !ok {
 		return "", &notFoundError{key: srcKey}
+	}
+	if m.CopyErr != nil {
+		// The ambiguous failure the HEAD probe exists for: the backend
+		// completed the copy and then lost the response. The destination path
+		// is minted inside the copy, so a test cannot seed it and the copy has
+		// to land here instead.
+		if m.CopyLandsBeforeErr {
+			m.Objects[dstKey] = src
+		}
+		return "", m.CopyErr
 	}
 	m.Objects[dstKey] = src
 	return src.ETag, nil
@@ -314,6 +363,64 @@ func (m *InMemory) Has(key string) bool {
 	defer m.mu.Unlock()
 	_, ok := m.Objects[key]
 	return ok
+}
+
+// HasCopyOf reports whether the backend holds bytes belonging to objectKey,
+// wherever they are: at the key itself, or under one of the per-write paths a
+// write stores its bytes at.
+//
+// A write's path carries a fresh id that no test can predict, so a test that
+// only cares whether the object arrived asks this instead of naming the path.
+func (m *InMemory) HasCopyOf(objectKey string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	prefix := internalkey.StorageKey(objectKey, "")
+	for key := range m.Objects {
+		if key == objectKey || strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// CopyOf returns the object the backend holds for objectKey, wherever it is:
+// at the key itself, or under the per-write path a write stored it at. It is
+// for assertions about the bytes rather than about the object's presence.
+//
+// When the backend holds more than one copy of the key, such as an overwrite
+// whose predecessor is not cleaned up yet, it returns an arbitrary one. A test
+// that cares which copy should assert on the path it expects instead.
+func (m *InMemory) CopyOf(objectKey string) (Object, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if obj, ok := m.Objects[objectKey]; ok {
+		return obj, true
+	}
+	prefix := internalkey.StorageKey(objectKey, "")
+	for key, obj := range m.Objects {
+		if strings.HasPrefix(key, prefix) {
+			return obj, true
+		}
+	}
+	return Object{}, false
+}
+
+// PathOf reports where the backend holds objectKey, which a test needs when it
+// has to name the path - to build a ledger row for it, say. Empty when the
+// backend holds nothing for the key.
+func (m *InMemory) PathOf(objectKey string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.Objects[objectKey]; ok {
+		return objectKey
+	}
+	prefix := internalkey.StorageKey(objectKey, "")
+	for key := range m.Objects {
+		if strings.HasPrefix(key, prefix) {
+			return key
+		}
+	}
+	return ""
 }
 
 // SetPutErr swaps the injected PutObject failure under the lock, for a test

@@ -63,7 +63,9 @@ func TestSqlite_ClearPendingForKey_RemovesAllButTheKept(t *testing.T) {
 		if len(cleared) != 1 {
 			t.Fatalf("cleared = %+v, want only the stale intent", cleared)
 		}
-		want := core.SupersededIntent{IntentID: "stale-a", BackendName: "backend-b", SizeBytes: 20}
+		// The seeded intent carries no path of its own, so the insert recorded
+		// the object's key, which is where such an intent's bytes would be.
+		want := core.SupersededIntent{IntentID: "stale-a", BackendName: "backend-b", StorageKey: "bucket/k", SizeBytes: 20}
 		if cleared[0] != want {
 			t.Errorf("cleared[0] = %+v, want %+v", cleared[0], want)
 		}
@@ -110,44 +112,6 @@ func TestSqlite_ClearPendingForKey_NoIntents(t *testing.T) {
 		}
 		if len(cleared) != 0 {
 			t.Errorf("cleared = %+v, want none", cleared)
-		}
-	})
-}
-
-// -------------------------------------------------------------------------
-// CountPendingOnBackend
-// -------------------------------------------------------------------------
-
-// TestSqlite_CountPendingOnBackend_CountsOnlyThatPath verifies the discard's
-// primitive counts the key's intents on the one backend, not the key's intents
-// on other backends nor other keys, and touches nothing.
-func TestSqlite_CountPendingOnBackend_CountsOnlyThatPath(t *testing.T) {
-	t.Parallel()
-	s := newTestStore(t)
-	ctx := context.Background()
-
-	seedPendingIntent(t, s, "landing-1", "bucket/k", "backend-b", 10)
-	seedPendingIntent(t, s, "landing-2", "bucket/k", "backend-b", 20)
-	seedPendingIntent(t, s, "other-backend", "bucket/k", "backend-a", 30)
-	seedPendingIntent(t, s, "other-key", "bucket/other", "backend-b", 40)
-
-	withAdapter(t, s, func(a *sqliteTxAdapter) {
-		n, err := a.CountPendingOnBackend(ctx, "bucket/k", "backend-b")
-		if err != nil {
-			t.Fatalf("CountPendingOnBackend: %v", err)
-		}
-		if n != 2 {
-			t.Errorf("counted %d intents, want the 2 on backend-b", n)
-		}
-		if got := countPendingForKey(t, a, "bucket/k"); got != 3 {
-			t.Errorf("rows for the key = %d, want all 3 still there", got)
-		}
-		n, err = a.CountPendingOnBackend(ctx, "bucket/k", "backend-c")
-		if err != nil {
-			t.Fatalf("CountPendingOnBackend on an empty path: %v", err)
-		}
-		if n != 0 {
-			t.Errorf("counted %d intents on an empty path, want 0", n)
 		}
 	})
 }
@@ -509,7 +473,7 @@ func TestAdapter_InsertReplicaConditional_InsertsWhenSourceExists(t *testing.T) 
 	mustRecordObject(t, s, "bucket/k", "backend-a", 100)
 
 	withAdapter(t, s, func(a *sqliteTxAdapter) {
-		size, ok, err := a.InsertReplicaConditional(ctx, "bucket/k", "backend-b", "backend-a")
+		size, ok, err := a.InsertReplicaConditional(ctx, &core.ReplicaInsert{ObjectKey: "bucket/k", TargetBackend: "backend-b", SourceBackend: "backend-a", StorageKey: "bucket/k" + "!r-" + "backend-b"})
 		if err != nil {
 			t.Fatalf("InsertReplicaConditional: %v", err)
 		}
@@ -550,7 +514,7 @@ func TestAdapter_InsertReplicaConditional_CarriesSourceCreatedAt(t *testing.T) {
 		}
 		sourceCreatedAt := before[0].CreatedAt
 
-		if _, _, err := a.InsertReplicaConditional(ctx, "bucket/k", "backend-b", "backend-a"); err != nil {
+		if _, _, err := a.InsertReplicaConditional(ctx, &core.ReplicaInsert{ObjectKey: "bucket/k", TargetBackend: "backend-b", SourceBackend: "backend-a", StorageKey: "bucket/k" + "!r-" + "backend-b"}); err != nil {
 			t.Fatalf("InsertReplicaConditional: %v", err)
 		}
 
@@ -577,7 +541,7 @@ func TestAdapter_InsertReplicaConditional_FalseWhenSourceMissing(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 	withAdapter(t, s, func(a *sqliteTxAdapter) {
-		size, ok, err := a.InsertReplicaConditional(context.Background(), "bucket/k", "backend-b", "backend-a")
+		size, ok, err := a.InsertReplicaConditional(context.Background(), &core.ReplicaInsert{ObjectKey: "bucket/k", TargetBackend: "backend-b", SourceBackend: "backend-a", StorageKey: "bucket/k" + "!r-" + "backend-b"})
 		if err != nil {
 			t.Fatalf("InsertReplicaConditional: %v", err)
 		}
@@ -601,7 +565,7 @@ func TestAdapter_InsertReplicaConditional_FalseWhenTargetExists(t *testing.T) {
 	mustRecordReplica(t, s, "bucket/k", "backend-b", "backend-a", 100)
 
 	withAdapter(t, s, func(a *sqliteTxAdapter) {
-		size, ok, err := a.InsertReplicaConditional(ctx, "bucket/k", "backend-b", "backend-a")
+		size, ok, err := a.InsertReplicaConditional(ctx, &core.ReplicaInsert{ObjectKey: "bucket/k", TargetBackend: "backend-b", SourceBackend: "backend-a", StorageKey: "bucket/k" + "!r-" + "backend-b"})
 		if err != nil {
 			t.Fatalf("InsertReplicaConditional: %v", err)
 		}
@@ -1116,7 +1080,7 @@ func TestAdapter_GetExistingCopiesForUpdate_CarriesEncryptionState(t *testing.T)
 	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 1100, Form: form}); err != nil {
 		t.Fatalf("RecordObject encrypted: %v", err)
 	}
-	if _, _, err := s.RecordReplica(ctx, key, "backend-b", "backend-a"); err != nil {
+	if _, _, err := s.RecordReplica(ctx, &core.ReplicaInsert{ObjectKey: key, TargetBackend: "backend-b", SourceBackend: "backend-a", StorageKey: key + "!r-" + "backend-b"}); err != nil {
 		t.Fatalf("RecordReplica: %v", err)
 	}
 

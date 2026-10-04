@@ -165,7 +165,10 @@ func (w *CleanupWorker) processCleanupItem(ctx context.Context, item *core.Clean
 		return ItemResult{Outcome: ItemSucceeded, Status: "success"}
 	}
 
-	delErr := w.deps.DeleteWithTimeout(ctx, be, item.ObjectKey)
+	// Delete the queued path, not the object's key. The row names the bytes one
+	// write put on this backend, and a later write of the same object has its
+	// own bytes that this deletion must not reach.
+	delErr := w.deps.DeleteWithTimeout(ctx, be, core.StoragePath(item.ObjectKey, item.StorageKey))
 	w.deps.Acct().APICall(s3op.DeleteObject, item.BackendName)
 
 	if delErr == nil {

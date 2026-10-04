@@ -25,14 +25,19 @@ import (
 // -------------------------------------------------------------------------
 
 // SweepStaleCleanupQueueRows removes every cleanup_queue row matching
-// the (objectKey, backend) pair and decrements the backend's
+// the (storageKey, backend) pair and decrements the backend's
 // orphan_bytes counter by the sum of their size_bytes. Used by the
 // reconciler when it deletes a stale object_locations row so the
-// queue does not retain orphan entries pointing at a key the backend
+// queue does not retain orphan entries pointing at bytes the backend
 // no longer holds. Returns the number of rows deleted.
-func SweepStaleCleanupQueueRows(ctx context.Context, runner Runner, objectKey, backend string) (int64, error) {
+//
+// Rows are matched on the path rather than the object, because reconcile only
+// established that the bytes at that path are gone. Sweeping by object would
+// also drop queued deletions for the key's other writes, whose bytes are still
+// on the backend.
+func SweepStaleCleanupQueueRows(ctx context.Context, runner Runner, storageKey, backend string) (int64, error) {
 	return WithTxVal(ctx, runner, func(ctx context.Context, tx TxAdapter) (int64, error) {
-		rowCount, totalBytes, err := tx.SumAndDeleteCleanupQueueRows(ctx, objectKey, backend)
+		rowCount, totalBytes, err := tx.SumAndDeleteCleanupQueueRows(ctx, storageKey, backend)
 		if err != nil {
 			return 0, err
 		}

@@ -12,7 +12,6 @@ package core
 
 import (
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
@@ -98,15 +97,20 @@ func StoredFormFromLocation(loc *ObjectLocation) *StoredForm {
 	}
 }
 
-// objectFromStoredForm builds an ObjectLocation suitable for
-// InsertObjectLocation from a key/backend/size triple plus the optional
-// description of how the bytes are stored and the optional client-facing
-// identity. A nil identity leaves the row's columns NULL, which is what a
-// write that never learned the object's ETag records.
-func objectFromStoredForm(key, backend string, size int64, form *StoredForm, id *ObjectIdentity) *ObjectLocation {
+// ObjectFromStoredForm builds an ObjectLocation suitable for
+// InsertObjectLocation from a key/backend/storage-key/size tuple plus the
+// optional description of how the bytes are stored and the optional
+// client-facing identity. A nil identity leaves the row's columns NULL, which
+// is what a write that never learned the object's ETag records.
+//
+// storageKey is where the bytes this row describes are. It is a parameter
+// rather than derived from key because it names the write that placed the
+// bytes, and the row is the only lasting record of it.
+func ObjectFromStoredForm(key, backend, storageKey string, size int64, form *StoredForm, id *ObjectIdentity) *ObjectLocation {
 	loc := &ObjectLocation{
 		ObjectKey:   key,
 		BackendName: backend,
+		StorageKey:  StoragePath(key, storageKey),
 		SizeBytes:   size,
 		Identity:    id,
 	}
@@ -131,43 +135,60 @@ func objectFromStoredForm(key, backend string, size int64, form *StoredForm, id 
 	return loc
 }
 
+// StoragePath resolves the path a copy occupies on its backend: the one it was
+// given, or the object's key when it was given none.
+//
+// A caller with no path is describing bytes at the object's key, which is
+// where a backfilled row and an imported object keep them. Resolving it here
+// also keeps an empty string out of the column, which the (backend_name,
+// storage_key) unique index would reject on the second such copy.
+func StoragePath(objectKey, storageKey string) string {
+	if storageKey == "" {
+		return objectKey
+	}
+	return storageKey
+}
+
 // -------------------------------------------------------------------------
 // COPY-DISPLACEMENT HELPER
 // -------------------------------------------------------------------------
 
-// displacedFromExisting filters an existing-copies slice down to the copies
-// that need physical orphan cleanup after an overwrite onto newBackends. The
-// new PUT overwrites in place on each backend it lands on, so a copy there is
-// replaced atomically; copies on every other backend become orphans.
-func displacedFromExisting(existing []ExistingCopy, newBackends []string) []DeletedCopy {
+// displacedFromExisting turns an overwritten copy set into the cleanup list
+// their removal owes.
+//
+// Every copy is displaced, including the ones on backends the new write lands
+// on. The new write stores its bytes at a path of its own, so the old copy
+// stays at its old path on that backend, and skipping it would leak the bytes.
+func displacedFromExisting(existing []ExistingCopy) []DeletedCopy {
 	if len(existing) == 0 {
 		return nil
 	}
-	var displaced []DeletedCopy
+	displaced := make([]DeletedCopy, 0, len(existing))
 	for _, ec := range existing {
-		if slices.Contains(newBackends, ec.BackendName) {
-			continue
-		}
 		displaced = append(displaced, DeletedCopy{
 			BackendName: ec.BackendName,
+			StorageKey:  ec.StorageKey,
 			SizeBytes:   ec.SizeBytes,
 		})
 	}
 	return displaced
 }
 
-// copySizeForBackend returns the SizeBytes of the copy held on backendName
-// and true, or (0, false) when the locked re-read holds no copy there.
+// copyOnBackend returns the copy held on backendName and true, or (zero, false)
+// when the locked re-read holds no copy there.
+//
 // Reading the size from the locked set rather than the caller's stale value
 // keeps object_locations.size_bytes and backend_quotas.bytes_used in
-// agreement across a concurrent overwrite.
-func copySizeForBackend(existing []ExistingCopy, backendName string) (int64, bool) {
+// agreement across a concurrent overwrite. The storage key comes from the same
+// read because the caller's copy of it may name bytes a newer write has
+// already replaced, and deleting those would remove the wrong object.
+func copyOnBackend(existing []ExistingCopy, backendName string) (ExistingCopy, bool) {
 	for _, ec := range existing {
 		if ec.BackendName == backendName {
-			return ec.SizeBytes, true
+			return ec, true
 		}
 	}
-	return 0, false
+	return ExistingCopy{}, false
 }
 
 // isLastDecryptableCopy reports whether the copy on backendName is the only
