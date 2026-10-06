@@ -145,8 +145,8 @@ same PR. Docs-only and workflow-only changes do not need a bump.
 
 Choose the increment with conventional semver sense:
 
-- **patch** (`vX.Y.Z` → `vX.Y.(Z+1)`) for a bug fix or internal cleanup
-- **minor** (`vX.Y.Z` → `vX.(Y+1).0`) for a new CLI command, endpoint, or
+- **patch** (`vX.Y.Z` -> `vX.Y.(Z+1)`) for a bug fix or internal cleanup
+- **minor** (`vX.Y.Z` -> `vX.(Y+1).0`) for a new CLI command, endpoint, or
   user-visible behaviour
 
 The Releasing section below still describes what `make release` does with the
@@ -168,7 +168,10 @@ Prefer fixing the finding. When a directive is genuinely needed:
 The `sonarqube` CI job needs `SONAR_TOKEN`. GitHub withholds repository secrets
 from pull requests opened from forks, so that job fails for outside
 contributors even when everything else is green. Ignore that failure on a fork
-PR; maintainers re-run analysis after merge.
+PR; the scan runs again on main after merge.
+
+CI also does not start on a first-time contributor's PR until a maintainer
+approves the run, so a PR with no checks yet is waiting on that, not broken.
 
 ## Reporting Issues
 
