@@ -79,6 +79,7 @@ item, and a terminal `result`.
 | `reconcile` | `reconciling` | backend |
 | `replicate` | `replicating` | object key |
 | `over-replication --execute` | `removing` | object key |
+| `unreadable --execute` | `purging` | object key |
 | `lifecycle` | `expiring` | object key |
 | `remove-backend --purge --confirm` | `deleting` | object key |
 
@@ -187,6 +188,12 @@ s3-orchestrator admin rebalance
 # found nothing expired.
 s3-orchestrator admin lifecycle
 
+# List copies encrypted with no key, and how many there are
+s3-orchestrator admin unreadable -limit 50
+
+# Delete every copy encrypted with no key: bytes, rows and quota
+s3-orchestrator admin unreadable --execute
+
 # Show count of over-replicated objects
 s3-orchestrator admin over-replication
 
@@ -256,7 +263,9 @@ s3-orchestrator admin scrub -key photos/2024/beach.jpg
 # Scrub only one backend's copies
 s3-orchestrator admin scrub -backend wasabi-eu
 
-# Compute and store content hashes for all unhashed objects
+# Compute and store content hashes for all unhashed objects. A copy that can
+# never be decoded (its row and bytes disagree about encryption, or it is
+# compressed with no codec configured) is skipped and counted as unreadable.
 s3-orchestrator admin backfill-checksums
 
 # Hash only the copies on one backend, which is what a restored backend needs
@@ -547,7 +556,7 @@ Import reads the start of each object to see whether it is an orchestrator encry
 
 An envelope needs the key that encrypted it. Every write mints its own key, so a matching object key is not enough to prove a stray copy belongs to the row the ledger still holds: import adopts an existing copy's key only when the object's header shows the two came from the same encryption. That is the normal case for a replica whose row was lost, and it is imported fully readable.
 
-An envelope no surviving row can decrypt is recorded as encrypted with no key. It counts toward quota, but reads of that copy fail rather than returning ciphertext, and it is counted under `s3o_import_classified_total{decision="unreadable"}`. Restore those objects from another source or delete them; the key is gone.
+An envelope no surviving row can decrypt is recorded as encrypted with no key, and as unmanaged. It counts toward quota, but clients cannot list or read it and no worker acts on it, and it is counted under `s3o_import_classified_total{decision="unreadable"}`. Restore those objects from another source or delete them; the key is gone.
 
 ### Compressed objects
 

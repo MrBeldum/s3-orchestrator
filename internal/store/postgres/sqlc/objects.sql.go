@@ -175,6 +175,19 @@ func (q *Queries) CountUnencryptedLocations(ctx context.Context) (int64, error) 
 	return count, err
 }
 
+const countUnreadableLocations = `-- name: CountUnreadableLocations :one
+SELECT count(*) FROM object_locations
+WHERE encrypted AND (encryption_key IS NULL OR length(encryption_key) = 0)
+`
+
+// Same predicate as ListUnreadableLocations.
+func (q *Queries) CountUnreadableLocations(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countUnreadableLocations)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteObjectCopies = `-- name: DeleteObjectCopies :exec
 DELETE FROM object_locations
 WHERE object_key = $1
@@ -222,7 +235,7 @@ func (q *Queries) DeleteObjectsByKeys(ctx context.Context, objectKeys []string) 
 }
 
 const getAllObjectLocations = `-- name: GetAllObjectLocations :many
-SELECT object_key, backend_name, storage_key, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_format_version, logical_size, etag, content_type, user_metadata, created_at, last_scrubbed_at
+SELECT object_key, backend_name, storage_key, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_format_version, logical_size, etag, content_type, user_metadata, created_at, last_scrubbed_at, managed
 FROM object_locations
 WHERE object_key = $1
 ORDER BY created_at ASC
@@ -247,6 +260,7 @@ type GetAllObjectLocationsRow struct {
 	UserMetadata             []byte
 	CreatedAt                pgtype.Timestamptz
 	LastScrubbedAt           pgtype.Timestamptz
+	Managed                  bool
 }
 
 func (q *Queries) GetAllObjectLocations(ctx context.Context, objectKey string) ([]GetAllObjectLocationsRow, error) {
@@ -277,6 +291,7 @@ func (q *Queries) GetAllObjectLocations(ctx context.Context, objectKey string) (
 			&i.UserMetadata,
 			&i.CreatedAt,
 			&i.LastScrubbedAt,
+			&i.Managed,
 		); err != nil {
 			return nil, err
 		}
@@ -1227,6 +1242,7 @@ SELECT DISTINCT ON (object_key COLLATE "C") object_key, backend_name, storage_ke
 FROM object_locations
 WHERE object_key LIKE $1::text || '%' ESCAPE '\'
   AND object_key COLLATE "C" > $2
+  AND managed
 ORDER BY object_key COLLATE "C", created_at ASC
 LIMIT $3
 `
@@ -1251,7 +1267,8 @@ type ListObjectsByPrefixRow struct {
 // LC_COLLATE. The cursor predicate carries the same collation as the ORDER BY -
 // splitting them would page a byte-ordered scan with a locale-ordered cursor and
 // skip or repeat keys. DISTINCT ON must carry it too, or Postgres rejects the
-// query for not matching the leading ORDER BY expression.
+// query for not matching the leading ORDER BY expression. Unmanaged rows are
+// left out because clients cannot read them.
 func (q *Queries) ListObjectsByPrefix(ctx context.Context, arg ListObjectsByPrefixParams) ([]ListObjectsByPrefixRow, error) {
 	rows, err := q.db.Query(ctx, listObjectsByPrefix, arg.Prefix, arg.StartAfter, arg.MaxKeys)
 	if err != nil {
@@ -1285,6 +1302,7 @@ WITH RECURSIVE walk(k) AS (
        FROM object_locations
       WHERE object_key LIKE $4::text || '%' ESCAPE '\'
         AND object_key COLLATE "C" > $5::text
+        AND managed
       ORDER BY object_key COLLATE "C"
       LIMIT 1)
     UNION ALL
@@ -1292,6 +1310,7 @@ WITH RECURSIVE walk(k) AS (
         SELECT object_key
           FROM object_locations
          WHERE object_key LIKE $4::text || '%' ESCAPE '\'
+           AND managed
            AND object_key COLLATE "C" > CASE
             WHEN position($2::text IN substr(walk.k, length($1::text) + 1)) > 0 THEN
                 substr(walk.k, 1, length($1::text) + position($2::text IN substr(walk.k, length($1::text) + 1)) + length($2::text) - 2)
@@ -1328,6 +1347,7 @@ LEFT JOIN LATERAL (
            etag, created_at
       FROM object_locations o2
      WHERE o2.object_key = w.k
+       AND o2.managed
        AND position($2::text IN substr(w.k, length($1::text) + 1)) = 0
      ORDER BY created_at ASC
      LIMIT 1
@@ -1356,6 +1376,8 @@ type ListObjectsDelimitedRow struct {
 	CreatedAt    pgtype.Timestamptz
 }
 
+// Unmanaged rows are left out of the walk and the leaf lookup, as in
+// ListObjectsByPrefix.
 // Every projected column is forced non-null (empty string / 0 / epoch) because
 // the built-in sqlc analyzer cannot infer nullability for computed and
 // LATERAL-joined columns; the Go side uses is_prefix to pick the meaningful
@@ -1557,6 +1579,51 @@ func (q *Queries) ListUnencryptedLocations(ctx context.Context, arg ListUnencryp
 			&i.StorageKey,
 			&i.SizeBytes,
 			&i.Etag,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUnreadableLocations = `-- name: ListUnreadableLocations :many
+SELECT object_key, backend_name, storage_key, size_bytes, created_at
+FROM object_locations
+WHERE encrypted AND (encryption_key IS NULL OR length(encryption_key) = 0)
+ORDER BY object_key, backend_name
+LIMIT $1
+`
+
+type ListUnreadableLocationsRow struct {
+	ObjectKey   string
+	BackendName string
+	StorageKey  string
+	SizeBytes   int64
+	CreatedAt   pgtype.Timestamptz
+}
+
+// Copies imported as encrypted with no key, which nothing can decrypt. Purging
+// a copy takes it out of this set, so the purge re-reads from the start rather
+// than paging.
+func (q *Queries) ListUnreadableLocations(ctx context.Context, rowLimit int32) ([]ListUnreadableLocationsRow, error) {
+	rows, err := q.db.Query(ctx, listUnreadableLocations, rowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUnreadableLocationsRow{}
+	for rows.Next() {
+		var i ListUnreadableLocationsRow
+		if err := rows.Scan(
+			&i.ObjectKey,
+			&i.BackendName,
+			&i.StorageKey,
+			&i.SizeBytes,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

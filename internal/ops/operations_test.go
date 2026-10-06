@@ -936,6 +936,62 @@ func TestBackfillChecksums_StopsAtObjectCap(t *testing.T) {
 	}
 }
 
+// TestBackfillChecksums_ReportsUnreadable asserts the copies each pass skipped
+// as undecodable are summed across passes into the run's result.
+func TestBackfillChecksums_ReportsUnreadable(t *testing.T) {
+	t.Parallel()
+	scrubber := opstest.NewMockScrubberOps(gomock.NewController(t))
+	gomock.InOrder(
+		scrubber.EXPECT().Backfill(gomock.Any(), 10, 0, "", gomock.Any()).
+			Return(worker.WorkSummary{Attempted: 8, Succeeded: 8, Skipped: 2}, 10),
+		scrubber.EXPECT().Backfill(gomock.Any(), 10, 10, "", gomock.Any()).
+			Return(worker.WorkSummary{Skipped: 3}, 0),
+	)
+
+	res, err := integrityOver(t, scrubber).BackfillChecksums(context.Background(), 10, 0, 0, "", nil)
+	if err != nil {
+		t.Fatalf("BackfillChecksums: %v", err)
+	}
+	if res.Unreadable != 5 || !res.Done {
+		t.Errorf("res = %+v, want 5 unreadable and the backlog drained", res)
+	}
+}
+
+// TestPurgeUnreadable_RunsUntilAPassPurgesNothing asserts the purge keeps
+// taking batches while they make progress, and stops on the first that
+// purges nothing so copies that keep failing cannot loop it.
+func TestPurgeUnreadable_RunsUntilAPassPurgesNothing(t *testing.T) {
+	t.Parallel()
+	scrubber := opstest.NewMockScrubberOps(gomock.NewController(t))
+	gomock.InOrder(
+		scrubber.EXPECT().PurgeUnreadable(gomock.Any(), 100, gomock.Any()).Return(worker.WorkSummary{Succeeded: 100}),
+		scrubber.EXPECT().PurgeUnreadable(gomock.Any(), 100, gomock.Any()).Return(worker.WorkSummary{Succeeded: 3, Failed: 1}),
+		scrubber.EXPECT().PurgeUnreadable(gomock.Any(), 100, gomock.Any()).Return(worker.WorkSummary{Failed: 1}),
+	)
+
+	res := integrityOver(t, scrubber).PurgeUnreadable(context.Background(), 0, nil)
+	if res.Purged != 103 || res.Failed != 2 {
+		t.Errorf("res = %+v, want 103 purged and 2 failed", res)
+	}
+}
+
+// TestListUnreadable_DefaultsTheLimit asserts a zero limit asks the scrubber
+// for the default page and passes the total through.
+func TestListUnreadable_DefaultsTheLimit(t *testing.T) {
+	t.Parallel()
+	scrubber := opstest.NewMockScrubberOps(gomock.NewController(t))
+	scrubber.EXPECT().ListUnreadable(gomock.Any(), 100).
+		Return([]core.ObjectLocation{{ObjectKey: "bucket/a", BackendName: "b1"}}, int64(7), nil)
+
+	res, err := integrityOver(t, scrubber).ListUnreadable(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("ListUnreadable: %v", err)
+	}
+	if res.Total != 7 || len(res.Copies) != 1 {
+		t.Errorf("res = %+v, want 1 copy of 7", res)
+	}
+}
+
 // TestEncryptExisting_CountsUnreachableBackend asserts one location whose
 // backend is gone fails on its own rather than ending the pass.
 func TestEncryptExisting_CountsUnreachableBackend(t *testing.T) {
